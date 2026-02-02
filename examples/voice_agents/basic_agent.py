@@ -19,74 +19,143 @@ Outcome:
 
 import logging
 import re
-import asyncio
-from typing import Optional
 from dotenv import load_dotenv
 from livekit.agents import (
-    Agent, AgentServer, AgentSession, JobContext, JobProcess,
-    cli, UserInputTranscribedEvent, AgentStateChangedEvent,
-    UserStateChangedEvent
+    Agent, AgentServer, AgentSession, JobContext, JobProcess, cli
 )
-from livekit.plugins import silero, deepgram, openai, cartesia
+from livekit.plugins import silero
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 logger = logging.getLogger("intelligent-kelly")
 logger.setLevel(logging.INFO)
 load_dotenv()
 
-# CONFIGURATION
-STOP_WORDS = {"wait", "stop", "finish", "hold", "pause", "halt"}
+# =============================================================================
+# CONFIGURATION - Command and Filler Detection
+# =============================================================================
+
+# Single words that mean "stop" as a command
+STOP_WORDS = {"wait", "stop", "finish", "hold", "pause", "halt", "enough", "quiet"}
+
+# Multi-word command phrases (normalized, no spaces)
+STOP_PHRASES = {
+    "holdon", "holdonthat", "waitasec", "waitasecond", "waitaminute",
+    "stopit", "stopthat", "stopnow", "pausethat", "onemoment"
+}
+
+# Words that can precede a stop word to form a command
+COMMAND_PREFIXES = {"no", "but", "and", "okay", "ok", "yeah", "yes", "hey", "please"}
+
+# Pure filler/acknowledgment words (no overlap with meaningful words)
 FILLER_WORDS = {
     "uhhuh", "okay", "alright", "mhm", "yeah", "yep", "yup",
-    "hmm", "right", "uh", "um", "ah", "gotit", "isee", "ok", "k",
-    "sure", "yes", "interesting", "really", "wow", "ohh", "ooh",
-    "aha", "mhmm", "gotcha", "nice", "oh", "all", "got", "it", "i", "see"
+    "hmm", "right", "uh", "um", "ah", "ok", "k", "sure", "yes",
+    "interesting", "really", "wow", "ohh", "ooh", "aha", "mhmm",
+    "gotcha", "nice", "oh", "no", "nah", "nope", "cool", "great"
 }
-FILLER_PHRASES = {"all right", "got it", "i see", "uh huh", "oh okay", "oh ok"}
 
-def is_filler_input(transcript: str) -> bool:
-    """Check if transcript is purely a filler acknowledgment"""
+# Multi-word filler phrases (normalized with spaces for matching)
+FILLER_PHRASES = {
+    "all right", "got it", "i see", "uh huh", "oh okay", "oh ok",
+    "oh really", "oh wow", "oh nice", "sounds good", "makes sense",
+    "i understand", "mm hmm", "uh huh"
+}
+
+
+def normalize_text(transcript: str) -> str:
+    """Normalize transcript for consistent matching."""
     clean = transcript.lower().strip()
-    clean_no_punct = re.sub(r'[^\w\s]', '', clean)
-    
-    if clean_no_punct in FILLER_PHRASES:
-        return True
-    if clean_no_punct.replace(" ", "") in FILLER_WORDS:
-        return True
-    
-    words = clean_no_punct.split()
-    if words and all(word in FILLER_WORDS for word in words):
-        return True
-    return False
+    clean = re.sub(r'[^\w\s]', '', clean)  # Remove punctuation
+    clean = re.sub(r'\s+', ' ', clean)      # Collapse whitespace
+    return clean.strip()
+
 
 def contains_command(transcript: str) -> bool:
-    """Check if transcript contains an explicit stop command"""
-    clean = transcript.lower().strip()
-    clean_no_punct = re.sub(r'[^\w\s]', '', clean)
-    words = clean_no_punct.split()
+    """
+    Check if transcript contains an explicit stop command.
+    MUST be checked BEFORE is_filler_input() to avoid false negatives.
+    """
+    text = normalize_text(transcript)
+    words = text.split()
     
     if not words:
         return False
     
-    # Direct command (starts with stop word)
+    # Check for exact stop phrase match (e.g., "hold on")
+    text_no_spaces = text.replace(" ", "")
+    if text_no_spaces in STOP_PHRASES:
+        return True
+    
+    # Check for stop phrase at start (e.g., "hold on a second please")
+    for phrase in STOP_PHRASES:
+        if text_no_spaces.startswith(phrase):
+            return True
+    
+    # Direct command: first word is a stop word (e.g., "stop", "wait")
     if words[0] in STOP_WORDS:
         return True
     
-    # Command after brief acknowledgment: "yeah wait", "okay stop"
-    if len(words) >= 2:
-        for i in range(len(words) - 1):
-            if words[i] in FILLER_WORDS and words[i + 1] in STOP_WORDS:
+    # Command after prefix: "yeah wait", "okay stop", "no hold on", "but wait"
+    # Check first 3 words for pattern: [prefix] + [stop_word]
+    for i in range(min(3, len(words))):
+        if words[i] in STOP_WORDS:
+            # If stop word is in first 3 positions, it's likely a command
+            # Unless it's a long sentence where stop word is incidental
+            if len(words) <= 5:
                 return True
-            if words[i] in {"but", "and"} and words[i + 1] in STOP_WORDS:
+            # For longer sentences, only count if stop word is in first 2 positions
+            if i < 2:
                 return True
     
-    # Avoid false positives in longer sentences
-    # "I have no idea" should NOT be a command
-    if len(words) > 3 and any(w in STOP_WORDS for w in words):
-        # Only treat as command if stop word is in first 2 positions
-        return any(words[i] in STOP_WORDS for i in range(min(2, len(words))))
+    # Pattern: prefix + stop word anywhere in first 4 words
+    # e.g., "okay wait a second", "no hold on please"
+    if len(words) >= 2:
+        for i in range(min(3, len(words) - 1)):
+            if words[i] in COMMAND_PREFIXES and words[i + 1] in STOP_WORDS:
+                return True
     
     return False
+
+
+def is_filler_input(transcript: str) -> bool:
+    """
+    Check if transcript is purely a filler acknowledgment.
+    Only returns True if it's DEFINITELY a filler (no command content).
+    """
+    text = normalize_text(transcript)
+    
+    # CRITICAL: Command always takes priority - check first!
+    if contains_command(transcript):
+        return False
+    
+    # Empty or very short
+    if not text:
+        return True
+    
+    # Exact filler phrase match
+    if text in FILLER_PHRASES:
+        return True
+    
+    # Single word in filler set
+    words = text.split()
+    if len(words) == 1 and words[0] in FILLER_WORDS:
+        return True
+    
+    # All words are fillers (e.g., "yeah yeah", "okay um", "oh really")
+    if len(words) <= 3 and all(word in FILLER_WORDS for word in words):
+        return True
+    
+    # Compound filler check (e.g., "uhhuh" -> "uh huh")
+    text_no_spaces = text.replace(" ", "")
+    if text_no_spaces in FILLER_WORDS:
+        return True
+    
+    return False
+
+
+# =============================================================================
+# AGENT DEFINITION
+# =============================================================================
 
 class IntelligentAgent(Agent):
     def __init__(self) -> None:
@@ -98,19 +167,56 @@ class IntelligentAgent(Agent):
                 "Only stop if they explicitly say 'wait', 'stop', or 'hold on'."
             ),
         )
-        self.is_speaking = False
-        self.was_interrupted_by_vad = False
-        self.last_speech_content = ""
-        
+        # Simplified state: only track if agent is currently speaking
+        self._is_speaking = False
+        # Track if VAD just interrupted (waiting for transcript to classify)
+        self._interrupted_by_vad = False
+    
+    @property
+    def is_speaking(self) -> bool:
+        return self._is_speaking
+    
+    @is_speaking.setter
+    def is_speaking(self, value: bool) -> None:
+        self._is_speaking = value
+    
+    @property
+    def interrupted_by_vad(self) -> bool:
+        return self._interrupted_by_vad
+    
+    @interrupted_by_vad.setter
+    def interrupted_by_vad(self, value: bool) -> None:
+        self._interrupted_by_vad = value
+
     async def on_enter(self):
-        await self.session.generate_reply()
+        # Wait for user to speak first (no preemptive greeting)
+        pass
+
+
+# =============================================================================
+# SERVER SETUP
+# =============================================================================
 
 server = AgentServer()
+
 
 def prewarm(proc: JobProcess):
     proc.userdata["vad"] = silero.VAD.load()
 
+
 server.setup_fnc = prewarm
+
+
+def try_clear_user_turn(session: AgentSession) -> bool:
+    """Safely attempt to clear user turn to suppress LLM processing."""
+    if hasattr(session, 'clear_user_turn'):
+        try:
+            session.clear_user_turn()
+            return True
+        except Exception as e:
+            logger.debug(f"clear_user_turn failed: {e}")
+    return False
+
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
@@ -122,142 +228,143 @@ async def entrypoint(ctx: JobContext):
         turn_detection=MultilingualModel(),
         
         # === HYBRID STRATEGY ===
-        # Medium-low threshold: Catches most fillers but allows quick commands
+        # Medium threshold: catches most fillers but allows quick commands through
         allow_interruptions=True,
-        min_interruption_duration=0.6,  # 0.6s - faster than most fillers, slower than most commands
-        min_interruption_words=2,        # Require 2 words minimum
+        min_interruption_duration=0.6,   # 0.6s - slower than most commands
+        min_interruption_words=2,         # Require 2+ words
         
-        # Enable auto-resume for false positives
-        false_interruption_timeout=1.0,  # Wait 1s for transcript
-        resume_false_interruption=True,  # Auto-resume if false positive
+        # Enable auto-resume for false positives (LiveKit handles this)
+        false_interruption_timeout=1.0,
+        resume_false_interruption=True,
         
         preemptive_generation=False,
         min_endpointing_delay=0.5,
         max_endpointing_delay=2.5,
     )
     
-    kelly = IntelligentAgent()
+    agent = IntelligentAgent()
     
-    logger.info("=" * 80)
-    logger.info("🚀 HYBRID INTELLIGENT INTERRUPTION HANDLER")
-    logger.info("⚙️  Strategy:")
-    logger.info("   - Medium VAD thresholds (0.6s, 2 words)")
-    logger.info("   - Auto-resume on false interruptions")
-    logger.info("   - Manual interrupt on commands that slip through")
-    logger.info("   - Transcript suppression for fillers")
-    logger.info("=" * 80)
+    logger.info("=" * 70)
+    logger.info("🚀 HYBRID INTELLIGENT INTERRUPTION HANDLER v2")
+    logger.info("   Strategy: VAD(0.6s, 2words) + Transcript Classification")
+    logger.info("=" * 70)
     
-    # Track interruption state
-    vad_just_interrupted = False
-    
+    # -------------------------------------------------------------------------
+    # EVENT: Agent starts speaking
+    # -------------------------------------------------------------------------
     @session.on("speech_created")
     def on_speech_created(ev):
-        nonlocal vad_just_interrupted
-        kelly.is_speaking = True
-        kelly.was_interrupted_by_vad = False
-        vad_just_interrupted = False
-        
-        # Store what Kelly is saying for potential resume
-        if hasattr(ev, 'speech_handle') and hasattr(ev.speech_handle, 'text'):
-            kelly.last_speech_content = ev.speech_handle.text
-        
-        logger.info("🎤 KELLY STARTED SPEAKING")
+        agent.is_speaking = True
+        agent.interrupted_by_vad = False
+        logger.info("🎤 Agent started speaking")
     
+    # -------------------------------------------------------------------------
+    # EVENT: Agent state changes
+    # -------------------------------------------------------------------------
     @session.on("agent_state_changed")
     def on_agent_state_changed(ev):
-        nonlocal vad_just_interrupted
+        logger.debug(f"🎭 Agent: {ev.old_state} → {ev.new_state}")
         
-        logger.info(f"🎭 AGENT STATE: {ev.old_state} → {ev.new_state}")
-        
-        # Detect if Kelly was interrupted while speaking
+        # Detect VAD interruption: speaking → listening transition
         if ev.old_state == "speaking" and ev.new_state == "listening":
-            if kelly.is_speaking:
-                kelly.was_interrupted_by_vad = True
-                vad_just_interrupted = True
-                logger.info("⚠️ KELLY INTERRUPTED - waiting for transcript to decide action...")
+            if agent.is_speaking:
+                agent.interrupted_by_vad = True
+                logger.info("⚠️ VAD interrupted - waiting for transcript...")
         
-        if ev.new_state == "listening":
-            kelly.is_speaking = False
+        # Update speaking state
+        if ev.new_state in ("listening", "thinking"):
+            agent.is_speaking = False
+        elif ev.new_state == "speaking":
+            agent.is_speaking = True
     
+    # -------------------------------------------------------------------------
+    # EVENT: User state changes (for logging only)
+    # -------------------------------------------------------------------------
     @session.on("user_state_changed")
     def on_user_state_changed(ev):
-        logger.info(f"👤 USER STATE: {ev.old_state} → {ev.new_state}")
+        logger.debug(f"👤 User: {ev.old_state} → {ev.new_state}")
     
-    # Try to register false interruption handler
-    try:
-        @session.on("agent_false_interruption")
-        def on_false_interruption(ev):
-            if hasattr(ev, 'resumed') and ev.resumed:
-                logger.info("✅ FALSE INTERRUPTION AUTO-RESUMED by LiveKit")
-    except:
-        logger.warning("⚠️ False interruption event not available in this LiveKit version")
-    
+    # -------------------------------------------------------------------------
+    # EVENT: Transcript received - MAIN LOGIC
+    # -------------------------------------------------------------------------
     @session.on("user_input_transcribed")
     def on_user_input_transcribed(ev):
-        nonlocal vad_just_interrupted
-        
+        # Only process final transcripts
         if not ev.is_final or not ev.transcript:
             return
         
-        clean_text = re.sub(r'[^\w\s]', '', ev.transcript.lower()).strip()
+        text = normalize_text(ev.transcript)
+        if not text:
+            return
         
-        logger.info(f"📝 TRANSCRIPT: '{clean_text}' | Kelly speaking: {kelly.is_speaking} | Just interrupted: {vad_just_interrupted}")
+        # Classify the input
+        has_command = contains_command(text)
+        is_filler = is_filler_input(text)
         
-        # === CASE 1: Kelly was just interrupted by VAD ===
-        if kelly.was_interrupted_by_vad or vad_just_interrupted:
+        logger.info(
+            f"📝 '{text}' | speaking={agent.is_speaking} | "
+            f"vad_interrupted={agent.interrupted_by_vad} | "
+            f"cmd={has_command} | filler={is_filler}"
+        )
+        
+        # =================================================================
+        # CASE 1: VAD just interrupted - classify and decide
+        # =================================================================
+        if agent.interrupted_by_vad:
+            agent.interrupted_by_vad = False  # Reset flag
             
-            if contains_command(clean_text):
-                logger.info(f"🛑 REAL COMMAND after VAD interrupt: '{clean_text}' - staying stopped")
-                kelly.was_interrupted_by_vad = False
-                vad_just_interrupted = False
-                # Allow normal processing - the interrupt was correct
+            if has_command:
+                # Real command - interruption was correct, let LLM process
+                logger.info(f"🛑 COMMAND after VAD: '{text}' - valid interrupt")
+                return  # Allow normal LLM processing
+            
+            if is_filler:
+                # False positive - LiveKit's resume_false_interruption handles resume
+                # Suppress transcript from LLM
+                logger.info(f"🔄 FILLER after VAD: '{text}' - suppressing")
+                try_clear_user_turn(session)
                 return
             
-            elif is_filler_input(clean_text):
-                logger.info(f"🔄 FALSE INTERRUPT: '{clean_text}' was just a filler - should resume")
-                kelly.was_interrupted_by_vad = False
-                vad_just_interrupted = False
-                
-                # LiveKit's resume_false_interruption should handle this automatically
-                # But we still suppress the transcript from reaching LLM
-                return
-            
-            else:
-                logger.info(f"✅ REAL INPUT after interrupt: '{clean_text}' - valid interruption")
-                kelly.was_interrupted_by_vad = False
-                vad_just_interrupted = False
-                # Allow normal processing
-                return
+            # Real input (not command, not filler) - valid interruption
+            logger.info(f"✅ REAL INPUT after VAD: '{text}'")
+            return  # Allow normal LLM processing
         
-        # === CASE 2: Kelly is currently speaking (VAD didn't interrupt yet) ===
-        if kelly.is_speaking:
-            
-            if contains_command(clean_text):
-                logger.info(f"🛑 STOP COMMAND while speaking: '{clean_text}' - forcing interrupt NOW")
+        # =================================================================
+        # CASE 2: Agent is currently speaking (no VAD interrupt yet)
+        # =================================================================
+        if agent.is_speaking:
+            if has_command:
+                # Force interrupt on command that VAD missed
+                logger.info(f"🛑 COMMAND while speaking: '{text}' - forcing interrupt")
                 session.interrupt()
+                return  # Allow LLM to process the command
+            
+            if is_filler:
+                # Ignore filler - don't interrupt, don't pass to LLM
+                logger.info(f"🔇 FILLER while speaking: '{text}' - ignored")
+                try_clear_user_turn(session)
                 return
             
-            elif is_filler_input(clean_text):
-                logger.info(f"🔇 FILLER while speaking: '{clean_text}' - completely ignored")
-                # Don't interrupt, don't pass to LLM
-                return
-            
-            else:
-                logger.info(f"💬 REAL INPUT while speaking: '{clean_text}' - allowing interrupt")
-                session.interrupt()
-                return
+            # Real input - interrupt and let LLM process
+            logger.info(f"💬 INPUT while speaking: '{text}' - interrupting")
+            session.interrupt()
+            return
         
-        # === CASE 3: Kelly is idle ===
-        if not kelly.is_speaking:
-            
-            if is_filler_input(clean_text):
-                logger.info(f"🍃 FILLER while idle: '{clean_text}' - suppressed")
-                return
-            
-            logger.info(f"✅ VALID INPUT while idle: '{clean_text}'")
-            # Normal processing
+        # =================================================================
+        # CASE 3: Agent is idle (not speaking)
+        # =================================================================
+        if is_filler:
+            # Suppress lone fillers when idle
+            logger.info(f"🍃 FILLER while idle: '{text}' - suppressed")
+            try_clear_user_turn(session)
+            return
+        
+        # Normal input - let LLM process
+        logger.info(f"✅ INPUT while idle: '{text}'")
+        # Allow normal processing
     
-    await session.start(agent=kelly, room=ctx.room)
+    await session.start(agent=agent, room=ctx.room)
+
 
 if __name__ == "__main__":
     cli.run_app(server)
