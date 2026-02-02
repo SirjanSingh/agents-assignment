@@ -1,20 +1,20 @@
 """
-THE ACTUAL WORKING HYBRID SOLUTION
+HYBRID INTERRUPTION HANDLING STRATEGY
 
-Problem statement:
-- "okay" said slowly (1.5s) should NOT interrupt
-- "stop" said quickly (0.5s) SHOULD interrupt immediately
-- Can't use duration-based filtering because it fails one of these cases
+Challenge:
+- Slow filler words (e.g., a 1.5s "okay") should NOT trigger an interruption.
+- Quick commands (e.g., a 0.5s "stop") MUST trigger an immediate interruption.
+- Pure duration-based filtering is insufficient as it cannot distinguish these cases reliably.
 
-Solution: 
-- Use MEDIUM thresholds (catches most fillers, but some slip through)
-- Have transcript handler RESUME if interrupted by filler
-- Have transcript handler FORCE INTERRUPT if command detected but VAD didn't trigger
+Implementation Strategy:
+- Configure VAD with MEDIUM sensitivity: Catches most valid speech but may allow some fillers.
+- Auto-Resume on Fillers: If a filler triggers an interruption, the transcript handler will resume the agent.
+- Force Interrupt on Commands: If a quick command is missed by VAD, the transcript handler will enforce an interrupt.
 
-This way:
-- Fast "stop" (0.5s) → Below threshold → VAD doesn't interrupt → Transcript handler forces interrupt ✅
-- Slow "okay" (1.5s) → Above threshold → VAD interrupts → Transcript handler RESUMES ✅
-- Fast "okay" (0.3s) → Below threshold → VAD doesn't interrupt → Transcript suppresses ✅
+Outcome:
+- Quick "stop" (0.5s): Ignored by VAD (too short) → Transcript Handler detects command and interrupts. ✅
+- Slow "okay" (1.5s): Triggered by VAD → Transcript Handler identifies filler and resumes speech. ✅
+- Quick "okay" (0.3s): Ignored by VAD → Transcript Handler identifies filler and suppresses it. ✅
 """
 
 import logging
