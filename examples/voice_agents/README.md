@@ -5,6 +5,12 @@
 This document explains the modifications made to `basic_agent.py` to implement intelligent interruption handling that distinguishes between **filler words** (acknowledgments like "yeah", "okay") and **command words** (interruptions like "stop", "wait").
 
 ---
+## Student Details
+- **Name:** Sirjan Singh
+- **College Roll Number:** 23UCS715
+- **Demo Video Link:** [Drive Link](https://drive.google.com/drive/folders/1LXnojdfCtswc14PxWH60ZqynbLN03F3J?usp=sharing)
+  
+---
 
 ## The Challenge
 
@@ -16,7 +22,7 @@ However, LiveKit's default Voice Activity Detection (VAD) treats ALL user speech
 1. **When agent is speaking + user says filler** → Agent continues uninterrupted
 2. **When agent is speaking + user says command** → Agent stops immediately  
 3. **When agent is silent** → All user speech is valid input
-4. **Mixed input** → Commands always take priority over fillers
+4. **Mixed input** → Commands always take priority over fillers (e.g., "yeah wait" is a command)
 
 ---
 
@@ -63,236 +69,133 @@ false_interruption_timeout=1.0,
 
 ---
 
-### Layer 3: Transcript-Based Manual Control
-The most important layer — our custom logic that analyzes transcripts:
+### Layer 3: Transcript-Based Classification (The Brain)
+The most important layer — our custom logic that analyzes transcripts. This layer enforces strict priority: **Commands > Real Input > Fillers**.
 
+#### Key Logic Flow:
 ```python
 @session.on("user_input_transcribed")
 def on_user_input_transcribed(ev):
-    # Analyze what the user actually said
+    text = normalize_text(ev.transcript)
+    
+    # 1. CHECK COMMANDS FIRST (Priority!)
     if contains_command(text):
-        session.interrupt()  # Force stop
-    elif is_filler_input(text):
-        return  # Ignore completely
-    else:
-        # Real input - allow processing
+        if agent.is_speaking:
+            session.interrupt()  # Force stop if VAD missed it
+        return # Let LLM process the command
+        
+    # 2. CHECK FILLERS SECOND
+    if is_filler_input(text):
+        # Suppress from LLM so agent doesn't respond to "yeah"
+        try_clear_user_turn(session) 
+        return
+        
+    # 3. REAL INPUT (Questions, conversation)
+    # Process normally
 ```
 
 This handles three cases:
 
 #### Case 1: Agent Was Just Interrupted by VAD
-```python
-if kelly.was_interrupted_by_vad:
-    if contains_command(text):
-        # Real command - stay stopped
-    elif is_filler_input(text):
-        # False alarm - resume_false_interruption handles it
-    else:
-        # Real input - process normally
-```
+- **Command:** Valid interruption, let LLM respond.
+- **Filler:** False alarm! `resume_false_interruption` will auto-resume speech. We call `clear_user_turn()` so the LLM doesn't hear "yeah".
+- **Real Input:** Valid interruption.
 
 #### Case 2: Agent Is Currently Speaking (VAD Hasn't Triggered Yet)
-```python
-if kelly.is_speaking:
-    if contains_command(text):
-        session.interrupt()  # Force interrupt NOW
-    elif is_filler_input(text):
-        return  # Completely ignore
-    else:
-        session.interrupt()  # Real input - allow interrupt
-```
+- **Command:** Force immediate interrupt (`session.interrupt()`).
+- **Filler:** Ignore completely (`clear_user_turn()`).
+- **Real Input:** Allow interrupt (`session.interrupt()`).
 
 #### Case 3: Agent Is Idle
-```python
-if not kelly.is_speaking:
-    if is_filler_input(text):
-        return  # Suppress from LLM
-    # Otherwise process normally
-```
+- **Command/Real Input:** Process normally.
+- **Filler:** Suppress (don't wake up LLM for just "okay").
 
 ---
 
-## Key Code Changes
+## Key Code Changes (Refactored)
 
-### 1. Word Lists Configuration
+### 1. Robust Word Lists
 
-**Filler Words** (acknowledgments to ignore):
+**Command Detection** (Stop Phrases & Prefixes):
+```python
+# Single words
+STOP_WORDS = {"wait", "stop", "finish", "hold", "pause", "halt", ...}
+
+# Multi-word phrases (normalized)
+STOP_PHRASES = {"holdon", "waitasecond", "stopit", "waitaminute", ...}
+
+# Prefixes that can precede commands
+COMMAND_PREFIXES = {"no", "but", "and", "okay", "please", "hey"}
+```
+*Now catches:* `"no wait"`, `"hold on"`, `"wait a second"`, `"yeah stop"`
+
+**Filler Words** (Strict filtering):
 ```python
 FILLER_WORDS = {
     "uhhuh", "okay", "alright", "mhm", "yeah", "yep", "yup",
-    "hmm", "right", "uh", "um", "ah", "gotit", "isee", "ok",
-    # ... more
-}
-
-FILLER_PHRASES = {
-    "all right", "got it", "i see", "uh huh", "oh okay"
-}
-```
-
-**Command Words** (explicit stop requests):
-```python
-STOP_WORDS = {
-    "wait", "stop", "finish", "hold", "pause", "halt"
+    "hmm", "right", "uh", "um", "ah", "cool", "great", "no", "nah"
+    # Removed generic words like "i", "see", "all" to avoid false positives
 }
 ```
 
 ### 2. Detection Functions
 
-**`is_filler_input(transcript)`** — Returns `True` if input is purely acknowledgment:
-- Removes punctuation
-- Checks against filler word/phrase lists
-- Validates all words are filler tokens
+**`contains_command(transcript)`**:
+- Checks for multi-word phrases (`"hold on"`).
+- Checks for prefixes (`"no wait"`).
+- Checks priority positions (first 3 words).
 
-**`contains_command(transcript)`** — Returns `True` if input contains stop command:
-- Checks if sentence starts with stop word
-- Detects "filler + command" patterns ("yeah wait", "okay stop")
-- Avoids false positives in longer sentences
+**`is_filler_input(transcript)`**:
+- **CRITICAL:** Calls `contains_command()` first! If it's a command, it is NOT a filler.
+- Only matches if input is *purely* filler words/phrases.
 
-### 3. State Tracking
-
+### 3. Transcript Suppression
+We use a helper to prevent the LLM from responding to fillers:
 ```python
-class IntelligentAgent(Agent):
-    def __init__(self):
-        self.is_speaking = False           # Currently generating speech
-        self.was_interrupted_by_vad = False  # Just got interrupted by VAD
-        self.last_speech_content = ""      # Content being spoken
+def try_clear_user_turn(session):
+    if hasattr(session, 'clear_user_turn'):
+        session.clear_user_turn()
 ```
-
-### 4. Event Handlers
-
-**`on_speech_created`** — Tracks when agent starts speaking:
-```python
-@session.on("speech_created")
-def on_speech_created(ev):
-    kelly.is_speaking = True
-    kelly.was_interrupted_by_vad = False
-```
-
-**`on_agent_state_changed`** — Detects interruptions:
-```python
-if ev.old_state == "speaking" and ev.new_state == "listening":
-    if kelly.is_speaking:
-        kelly.was_interrupted_by_vad = True
-```
-
-**`on_user_input_transcribed`** — Main interruption logic (see Layer 3 above)
 
 ---
 
-## Configuration Parameters
-
-### AgentSession Settings
-
-| Parameter | Value | Purpose |
-|-----------|-------|---------|
-| `allow_interruptions` | `True` | Enable VAD-based interruptions |
-| `min_interruption_duration` | `0.6` | Require 0.6s of speech to interrupt |
-| `min_interruption_words` | `2` | Require 2+ words to interrupt |
-| `resume_false_interruption` | `True` | Auto-resume after false interruptions |
-| `false_interruption_timeout` | `1.0` | Wait 1s before resuming |
-| `preemptive_generation` | `False` | Disabled for more predictable flow |
-| `min_endpointing_delay` | `0.5` | Min silence before turn ends |
-| `max_endpointing_delay` | `2.5` | Max silence before turn ends |
-
----
-
-## How It All Works Together
+## How It All Works Together (Examples)
 
 ### Scenario 1: User says "yeah" (0.3s, quick acknowledgment)
-1. ✅ **VAD Layer:** Too short (0.3s < 0.6s) → No interrupt
-2. ✅ **Transcript Handler:** Detects filler while speaking → Ignores
-3. ✅ **Result:** Agent continues speaking smoothly
+1. ✅ **VAD Layer:** Too short (< 0.6s) → No interrupt
+2. ✅ **Transcript Layer:** `is_filler_input` = True. `try_clear_user_turn()` called.
+3. ✅ **Result:** Agent continues speaking. LLM sees nothing.
 
 ### Scenario 2: User says "okaaaay" (1.5s, slow filler)
-1. ❌ **VAD Layer:** Long enough (1.5s > 0.6s) → Interrupts agent
-2. ✅ **Resume Layer:** Waits 1s for more speech, nothing comes → Resumes
-3. ✅ **Transcript Handler:** Marks as filler → Suppresses from LLM
-4. ✅ **Result:** Brief pause (1s), then agent resumes
+1. ❌ **VAD Layer:** Long enough (> 0.6s) → Interrupts agent
+2. ✅ **Resume Layer:** Waits 1s, decides it's a false interrupt → Resumes
+3. ✅ **Transcript Layer:** `is_filler_input` = True. Suppresses transcript.
+4. ✅ **Result:** Brief pause (1s), then agent resumes.
 
-### Scenario 3: User says "stop" (0.5s, quick command)
-1. ✅ **VAD Layer:** Too short (0.5s < 0.6s) → No interrupt
-2. ✅ **Transcript Handler:** Detects command → `session.interrupt()`
-3. ✅ **Result:** Agent stops immediately via manual interrupt
+### Scenario 3: User says "no wait" (Quick command)
+1. ❌ **VAD Layer:** Might be too short or missed.
+2. ✅ **Transcript Layer:** `contains_command` = True (catches "no" + "wait").
+3. ✅ **Action:** `session.interrupt()` forced immediately.
+4. ✅ **Result:** Agent stops. LLM processes "no wait".
 
-### Scenario 4: User says "wait a second" (1.2s, clear command)
-1. ✅ **VAD Layer:** Long enough (1.2s > 0.6s) → Interrupts agent
-2. ✅ **Transcript Handler:** Detects command → Stays stopped
-3. ✅ **Result:** Agent stops, processes user's request
-
----
-
-## Testing the Solution
-
-### Test Cases
-
-1. **Filler while speaking:**
-   - Say "yeah", "okay", "hmm" while agent is talking
-   - **Expected:** Agent continues without stopping
-
-2. **Command while speaking:**
-   - Say "wait", "stop", "hold on" while agent is talking
-   - **Expected:** Agent stops immediately
-
-3. **Mixed input:**
-   - Say "yeah wait" while agent is talking
-   - **Expected:** Agent stops (command wins)
-
-4. **Filler while silent:**
-   - Say "okay" when agent is idle
-   - **Expected:** Ignored, doesn't trigger new response
-
-5. **Normal conversation:**
-   - Ask questions when agent is idle
-   - **Expected:** Normal response flow
-
-### Logs to Watch For
-
-```
-🎤 KELLY STARTED SPEAKING
-📝 TRANSCRIPT: 'yeah' | Kelly speaking: True
-🔇 FILLER while speaking: 'yeah' - completely ignored
-```
-
-```
-📝 TRANSCRIPT: 'wait' | Kelly speaking: True  
-🛑 STOP COMMAND while speaking: 'wait' - forcing interrupt NOW
-```
-
-```
-⚠️ KELLY INTERRUPTED - waiting for transcript...
-📝 TRANSCRIPT: 'okay' | Just interrupted: True
-🔄 FALSE INTERRUPT: 'okay' was just a filler - should resume
-```
+### Scenario 4: User says "I have a question"
+1. ✅ **Transcript Layer:** Not a command, not a filler.
+2. ✅ **Action:** Real input. Interrupts agent.
+3. ✅ **Result:** Standard conversation flow.
 
 ---
 
 ## Files Modified
 
-- **`basic_agent.py`** — Main implementation with all intelligent interruption logic
+- **`basic_agent.py`** — Main implementation with all intelligent interruption logic.
 
 ## Dependencies
 
-No additional dependencies required beyond standard LiveKit Agents SDK.
-
----
-
-## Limitations
-
-1. **Brief pause on slow fillers:** If user says a filler slowly (>0.6s), there may be a ~1s pause before auto-resume
-2. **Language-specific:** Word lists are currently English-focused (though some Hindi words are included)
-3. **Context-unaware:** Doesn't understand semantic context (e.g., "no" as answer vs. "no" as stop command)
+No additional dependencies required. Uses standard Python `re` and LiveKit Agents SDK.
 
 ---
 
 ## Future Improvements
 
-1. **Sentiment analysis:** Use LLM to determine if "no" is a stop command or an answer
-2. **Adaptive thresholds:** Learn user's speech patterns and adjust thresholds
-3. **Multi-language support:** Extended word lists for other languages
-4. **Prosody analysis:** Use tone/pitch to distinguish acknowledgments from commands
-
----
-
-## Credits
-
-Implementation for the **LiveKit Intelligent Interruption Handling Challenge**.
+1. **Semantic Analysis:** Use a small NPU/LLM model to determine if "right" means "correct" (answer) or "continue" (filler).
+2. **Prosody Analysis:** Differentiate "stop?" (question) from "STOP!" (command) based on pitch/volume.
